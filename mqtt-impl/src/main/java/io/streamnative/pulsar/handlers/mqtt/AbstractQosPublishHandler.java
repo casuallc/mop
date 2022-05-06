@@ -16,8 +16,8 @@ package io.streamnative.pulsar.handlers.mqtt;
 import static io.streamnative.pulsar.handlers.mqtt.utils.PulsarMessageConverter.toPulsarMsg;
 import io.netty.channel.Channel;
 import io.netty.handler.codec.mqtt.MqttPublishMessage;
-import io.netty.util.ReferenceCountUtil;
 import io.streamnative.pulsar.handlers.mqtt.exception.MQTTNoMatchingSubscriberException;
+import io.streamnative.pulsar.handlers.mqtt.support.RetainedMessageHandler;
 import io.streamnative.pulsar.handlers.mqtt.utils.MessagePublishContext;
 import io.streamnative.pulsar.handlers.mqtt.utils.PulsarTopicUtils;
 import java.util.Optional;
@@ -35,12 +35,14 @@ import org.apache.pulsar.common.util.FutureUtil;
 public abstract class AbstractQosPublishHandler implements QosPublishHandler {
 
     protected final PulsarService pulsarService;
+    protected final RetainedMessageHandler retainedMessageHandler;
     protected final MQTTServerConfiguration configuration;
     protected final Channel channel;
 
-    protected AbstractQosPublishHandler(PulsarService pulsarService, MQTTServerConfiguration configuration,
+    protected AbstractQosPublishHandler(MQTTService mqttService, MQTTServerConfiguration configuration,
                                         Channel channel) {
-        this.pulsarService = pulsarService;
+        this.pulsarService = mqttService.getPulsarService();
+        this.retainedMessageHandler = mqttService.getRetainedMessageHandler();
         this.configuration = configuration;
         this.channel = channel;
     }
@@ -52,28 +54,28 @@ public abstract class AbstractQosPublishHandler implements QosPublishHandler {
     }
 
     protected CompletableFuture<PositionImpl> writeToPulsarTopic(MqttPublishMessage msg) {
+        return writeToPulsarTopic(msg, false);
+    }
+
+    /**
+     * Convert mqtt protocol message to pulsar message and send it.
+     * @param msg                    MQTT protocol message
+     * @param checkSubscription Check if the subscription exists, throw #{MQTTNoMatchingSubscriberException}
+     *                              if the subscription does not exist;
+     */
+    protected CompletableFuture<PositionImpl> writeToPulsarTopic(MqttPublishMessage msg,
+                                                                 boolean checkSubscription) {
         return getTopicReference(msg).thenCompose(topicOp -> topicOp.map(topic -> {
             MessageImpl<byte[]> message = toPulsarMsg(topic, msg);
             CompletableFuture<PositionImpl> ret = MessagePublishContext.publishMessages(message, topic);
-            ReferenceCountUtil.safeRelease(message.getDataBuffer());
             message.recycle();
-            return ret;
+            return ret.thenApply(position -> {
+                if (checkSubscription && topic.getSubscriptions().isEmpty()) {
+                    throw new MQTTNoMatchingSubscriberException(msg.variableHeader().topicName());
+                }
+                return position;
+            });
         }).orElseGet(() -> FutureUtil.failedFuture(
                 new BrokerServiceException.TopicNotFoundException(msg.variableHeader().topicName()))));
-    }
-
-    protected CompletableFuture<PositionImpl> writeToPulsarTopicAndCheckIfSubscriptionMatching(MqttPublishMessage msg) {
-        return getTopicReference(msg).thenCompose(topicOp -> topicOp.map(topic -> {
-                    if (topic.getSubscriptions().isEmpty()) {
-                        throw new MQTTNoMatchingSubscriberException(msg.variableHeader().topicName());
-                    }
-                    MessageImpl<byte[]> message = toPulsarMsg(topic, msg);
-                    CompletableFuture<PositionImpl> ret = MessagePublishContext.publishMessages(message, topic);
-                    ReferenceCountUtil.safeRelease(message.getDataBuffer());
-                    message.recycle();
-                    return ret;
-                })
-                .orElseGet(() -> FutureUtil.failedFuture(
-                        new BrokerServiceException.TopicNotFoundException(msg.variableHeader().topicName()))));
     }
 }
